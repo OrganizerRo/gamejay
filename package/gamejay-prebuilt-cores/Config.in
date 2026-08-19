@@ -1,0 +1,5 @@
+config BR2_PACKAGE_GAMEJAY_PREBUILT_CORES
+	bool "GameJay prebuilt libretro cores"
+	help
+	  Install the checksum-verified core bundle prepared by the
+	  Build-gamejay-img workflow.

@@ -1,146 +1,668 @@
-name: Build-gamejay-img
+name: Build GameJay images
 
 on:
   workflow_dispatch:
   push:
-    branches: [master]
-    paths:
-      - ".github/workflows/Build-gamejay-img.yml"
-      - "board/**"
-      - "configs/**"
-      - "package/**"
-      - "rootfs-overlay/**"
-      - "Config.in"
-      - "external.desc"
-      - "external.mk"
+    branches:
+      - master
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-gamejay-img-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-gamejay-img
+  cancel-in-progress: false
+
+env:
+  BUILDROOT_VERSION: "2025.02.10"
 
 jobs:
-  build:
+  base:
+    name: Prepare ABI-matched base
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    env:
-      BUILDROOT_VERSION: "2025.02.10"
-      BUILDROOT_DIR: ${{ github.workspace }}/.buildroot
-      OUTPUT_DIR: ${{ github.workspace }}/output
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
 
     steps:
       - name: Check out GameJay
         uses: actions/checkout@v4
 
-      - name: Install Buildroot host dependencies
+      - name: Compute base identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(support/gamejay-dependency-id.sh base)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "tag=gamejay-base-${BUILDROOT_VERSION}-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing base release
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install base build dependencies
+        if: steps.lookup.outputs.exists != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            bc bison build-essential cpio file flex git libelf-dev \
-            libncurses-dev libssl-dev locales make patch perl python3 \
-            rsync unzip wget xz-utils zip
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio file flex git libelf-dev libssl-dev \
+            libncurses-dev python3 rsync unzip wget xz-utils
 
-      - name: Cache Buildroot downloads
-        uses: actions/cache@v4
+      - name: Restore base downloads
+        id: restore-base-downloads
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
         with:
-          path: ~/.buildroot-ccache
-          key: gamejay-buildroot-${{ env.BUILDROOT_VERSION }}-${{ hashFiles('configs/**', 'package/**/*.mk') }}
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-base-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
           restore-keys: |
-            gamejay-buildroot-${{ env.BUILDROOT_VERSION }}-
+            gamejay-base-dl-${{ env.BUILDROOT_VERSION }}-
 
-      - name: Download pinned Buildroot release
+      - name: Restore base compiler cache
+        id: restore-base-ccache
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-base-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-base-ccache-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Download Buildroot
+        if: steps.lookup.outputs.exists != 'true'
         run: |
-          wget --quiet "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.xz"
+          wget -q "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.xz"
           tar -xf "buildroot-${BUILDROOT_VERSION}.tar.xz"
-          mv "buildroot-${BUILDROOT_VERSION}" "${BUILDROOT_DIR}"
 
-      - name: Configure GameJay
+      - name: Build ABI-matched base
+        if: steps.lookup.outputs.exists != 'true'
+        shell: bash
         run: |
-          make -C "${BUILDROOT_DIR}" \
-            O="${OUTPUT_DIR}" \
-            BR2_EXTERNAL="${GITHUB_WORKSPACE}" \
-            gamejay_x86_64_defconfig
-          make -C "${BUILDROOT_DIR}" O="${OUTPUT_DIR}" olddefconfig
+          set -euo pipefail
+          buildroot="$GITHUB_WORKSPACE/buildroot-${BUILDROOT_VERSION}"
+          output="$GITHUB_WORKSPACE/output-base"
+          common=(
+            "O=$output"
+            "BR2_EXTERNAL=$GITHUB_WORKSPACE"
+            "BR2_DL_DIR=$GITHUB_WORKSPACE/.br-dl"
+            "BR2_CCACHE_DIR=$GITHUB_WORKSPACE/.br-ccache"
+          )
+          make -C "$buildroot" "${common[@]}" gamejay_base_x86_64_defconfig
+          make -C "$buildroot" "${common[@]}" -j"$(nproc)"
+          make -C "$buildroot" "${common[@]}" legal-info
 
-      - name: Build OS and raw images
-        run: |
-          make -C "${BUILDROOT_DIR}" \
-            O="${OUTPUT_DIR}" \
-            BR2_DL_DIR="${HOME}/.buildroot-ccache" \
-            -j"$(nproc)"
+          test -s "$output/target/usr/lib/libSDL2-2.0.so.0"
+          test -d "$output/target/usr/lib/dri"
+          test -d "$output/target/lib/firmware/amdgpu"
+          test -s "$output/images/grub.img"
+          test -s "$output/images/efi-part/EFI/BOOT/bootx64.efi"
 
-      - name: Verify and compress images
+      - name: Package ABI-matched base
+        if: steps.lookup.outputs.exists != 'true'
+        shell: bash
         run: |
-          test -s "${OUTPUT_DIR}/images/gamejay.img"
-          test -s "${OUTPUT_DIR}/images/gamejay-bios.img"
-          grep -q 'GameJay OS' "${OUTPUT_DIR}/images/efi-part/EFI/BOOT/grub.cfg"
-          xz --threads=0 --compress --keep "${OUTPUT_DIR}/images/gamejay.img"
-          xz --threads=0 --compress --keep "${OUTPUT_DIR}/images/gamejay-bios.img"
+          set -euo pipefail
+          mkdir -p \
+            release-base/target release-base/staging release-base/images \
+            release-base/legal-info
+          cp -a output-base/target/. release-base/target/
+          cp -a output-base/staging/. release-base/staging/
+          cp -a output-base/images/grub.img release-base/images/
+          cp -a output-base/images/efi-part release-base/images/
+          cp -a output-base/legal-info/licenses release-base/legal-info/
+          cp -a output-base/legal-info/manifest.csv release-base/legal-info/
+          cp configs/gamejay_base_x86_64_defconfig release-base/
+          printf '%s\n' \
+            "Buildroot ${BUILDROOT_VERSION}" \
+            "Bootlin stable x86-64 glibc toolchain 2024.05-1" \
+            > release-base/TOOLCHAIN.txt
+          tar -C release-base -I 'xz -T0 -1' -cf gamejay-base.tar.xz \
+            target staging images legal-info \
+            gamejay_base_x86_64_defconfig TOOLCHAIN.txt
+          tar -C output-base/legal-info -I 'xz -T0 -1' \
+            -cf gamejay-base-sources.tar.xz sources
+          sha256sum gamejay-base.tar.xz > SHA256SUMS
+          sha256sum gamejay-base-sources.tar.xz > SOURCES_SHA256SUMS
+
+      - name: Publish base release
+        if: steps.lookup.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            gamejay-base.tar.xz SHA256SUMS \
+            gamejay-base-sources.tar.xz SOURCES_SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GameJay ABI-matched base ${TAG#gamejay-base-}" \
+            --notes "Content-addressed GameJay target and staging base. Includes firmware, Mesa, SDL2, GRUB images, runtime libraries, Buildroot legal metadata, and the exact base configuration." \
+            --prerelease
+
+      - name: Save base downloads
+        if: success() && steps.lookup.outputs.exists != 'true' && steps.restore-base-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-base-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+      - name: Save base compiler cache
+        if: always() && steps.lookup.outputs.exists != 'true' && steps.restore-base-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-base-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+  kernel:
+    name: Prepare pinned kernel
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+
+    steps:
+      - name: Check out GameJay
+        uses: actions/checkout@v4
+
+      - name: Compute kernel identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(support/gamejay-dependency-id.sh kernel)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "tag=gamejay-kernel-${BUILDROOT_VERSION}-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing kernel release
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install kernel build dependencies
+        if: steps.lookup.outputs.exists != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio file flex git libelf-dev libssl-dev \
+            rsync unzip wget xz-utils
+
+      - name: Restore kernel downloads
+        id: restore-kernel-downloads
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-kernel-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-kernel-dl-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Restore kernel compiler cache
+        id: restore-kernel-ccache
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-kernel-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-kernel-ccache-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Download Buildroot
+        if: steps.lookup.outputs.exists != 'true'
+        run: |
+          wget -q "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.xz"
+          tar -xf "buildroot-${BUILDROOT_VERSION}.tar.xz"
+
+      - name: Build kernel
+        if: steps.lookup.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          buildroot="$GITHUB_WORKSPACE/buildroot-${BUILDROOT_VERSION}"
+          output="$GITHUB_WORKSPACE/output-kernel"
+          common=(
+            "O=$output"
+            "BR2_EXTERNAL=$GITHUB_WORKSPACE"
+            "BR2_DL_DIR=$GITHUB_WORKSPACE/.br-dl"
+            "BR2_CCACHE_DIR=$GITHUB_WORKSPACE/.br-ccache"
+          )
+          make -C "$buildroot" "${common[@]}" gamejay_kernel_x86_64_defconfig
+          make -C "$buildroot" "${common[@]}" -j"$(nproc)" linux
+          test -s "$output/images/bzImage"
+
+      - name: Publish kernel release
+        if: steps.lookup.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-kernel
+          cp output-kernel/images/bzImage release-kernel/bzImage
           (
-            cd "${OUTPUT_DIR}/images"
-            sha256sum gamejay.img.xz gamejay-bios.img.xz > SHA256SUMS
-            zip -9 gamejay-images.zip \
-              gamejay.img.xz \
-              gamejay-bios.img.xz \
-              SHA256SUMS
+            cd release-kernel
+            sha256sum bzImage > SHA256SUMS
+          )
+          kernel_source="$(find output-kernel/build -maxdepth 1 \
+            -type d -name 'linux-*' -print -quit)"
+          test -n "$kernel_source"
+          mkdir -p release-kernel-source/gamejay-config
+          cp -a "$kernel_source" release-kernel-source/
+          cp configs/gamejay_kernel_x86_64_defconfig \
+            board/gamejay/linux-fragment.config \
+            release-kernel-source/gamejay-config/
+          tar -C release-kernel-source -I 'xz -T0 -1' \
+            -cf gamejay-kernel-sources.tar.xz .
+          sha256sum gamejay-kernel-sources.tar.xz > SOURCES_SHA256SUMS
+          gh release create "$TAG" \
+            release-kernel/bzImage release-kernel/SHA256SUMS \
+            gamejay-kernel-sources.tar.xz SOURCES_SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GameJay kernel ${TAG#gamejay-kernel-}" \
+            --notes "Content-addressed Linux kernel dependency for GameJay. Built from Linux 6.12.17 with the tracked GameJay kernel fragment and Bootlin's stable x86-64 glibc toolchain." \
+            --prerelease
+
+      - name: Save kernel downloads
+        if: success() && steps.lookup.outputs.exists != 'true' && steps.restore-kernel-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-kernel-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+      - name: Save kernel compiler cache
+        if: always() && steps.lookup.outputs.exists != 'true' && steps.restore-kernel-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-kernel-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+  cores:
+    name: Prepare pinned emulator cores
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+
+    steps:
+      - name: Check out GameJay
+        uses: actions/checkout@v4
+
+      - name: Compute core bundle identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(support/gamejay-dependency-id.sh cores)"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "tag=gamejay-cores-${BUILDROOT_VERSION}-${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Check for existing core release
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install core build dependencies
+        if: steps.lookup.outputs.exists != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cpio file git rsync unzip wget xz-utils
+
+      - name: Restore core downloads
+        id: restore-core-downloads
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-cores-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-cores-dl-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Restore core compiler cache
+        id: restore-core-ccache
+        if: steps.lookup.outputs.exists != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-cores-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-cores-ccache-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Download Buildroot
+        if: steps.lookup.outputs.exists != 'true'
+        run: |
+          wget -q "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.xz"
+          tar -xf "buildroot-${BUILDROOT_VERSION}.tar.xz"
+
+      - name: Build emulator cores
+        if: steps.lookup.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          buildroot="$GITHUB_WORKSPACE/buildroot-${BUILDROOT_VERSION}"
+          output="$GITHUB_WORKSPACE/output-cores"
+          common=(
+            "O=$output"
+            "BR2_EXTERNAL=$GITHUB_WORKSPACE"
+            "BR2_DL_DIR=$GITHUB_WORKSPACE/.br-dl"
+            "BR2_CCACHE_DIR=$GITHUB_WORKSPACE/.br-ccache"
+          )
+          make -C "$buildroot" "${common[@]}" gamejay_cores_x86_64_defconfig
+          make -C "$buildroot" "${common[@]}" -j"$(nproc)" \
+            libretro-snes9x2010 libretro-fceumm libretro-picodrive \
+            libretro-mame2003-plus libretro-pcsx-rearmed
+
+          mkdir -p release-cores/cores release-cores/licenses
+          for core in \
+            snes9x2010_libretro.so fceumm_libretro.so picodrive_libretro.so \
+            mame2003_plus_libretro.so pcsx_rearmed_libretro.so
+          do
+            path="$(find "$output/build" -type f -name "$core" -print -quit)"
+            test -n "$path"
+            install -m 0755 "$path" "release-cores/cores/$core"
+          done
+
+          {
+            echo "GameJay libretro core source revisions"
+            echo
+            for recipe in package/libretro-*/libretro-*.mk; do
+              grep -E '_(VERSION|SITE) = ' "$recipe"
+            done
+          } > release-cores/SOURCES.txt
+
+          while IFS= read -r license; do
+            package="$(basename "$(dirname "$license")")"
+            cp "$license" "release-cores/licenses/${package}-$(basename "$license")"
+          done < <(
+            find "$output/build" -maxdepth 2 -type f \
+              \( -iname 'copying*' -o -iname 'license*' \) -print
           )
 
-      - name: Upload flashable images
+          tar -C release-cores -cJf gamejay-cores.tar.xz cores licenses SOURCES.txt
+          sha256sum gamejay-cores.tar.xz > SHA256SUMS
+          mkdir -p release-core-sources/packages
+          for source_dir in "$output"/build/libretro-*; do
+            cp -a "$source_dir" release-core-sources/
+          done
+          cp -a package/libretro-* release-core-sources/packages/
+          tar -C release-core-sources -I 'xz -T0 -1' \
+            -cf gamejay-cores-sources.tar.xz .
+          sha256sum gamejay-cores-sources.tar.xz > SOURCES_SHA256SUMS
+
+      - name: Publish core release
+        if: steps.lookup.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.identity.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            gamejay-cores.tar.xz SHA256SUMS \
+            gamejay-cores-sources.tar.xz SOURCES_SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GameJay emulator cores ${TAG#gamejay-cores-}" \
+            --notes "Content-addressed GameJay libretro core bundle. Exact source revisions and license files are included in the archive. This preserves reproducibility without consuming mutable Libretro nightly binaries." \
+            --prerelease
+
+      - name: Save core downloads
+        if: success() && steps.lookup.outputs.exists != 'true' && steps.restore-core-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-cores-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+      - name: Save core compiler cache
+        if: always() && steps.lookup.outputs.exists != 'true' && steps.restore-core-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-cores-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+
+  image:
+    name: Build bootable images
+    needs:
+      - base
+      - kernel
+      - cores
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out GameJay
+        uses: actions/checkout@v4
+
+      - name: Install image build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential cpio file flex git libelf-dev libssl-dev \
+            libncurses-dev python3 rsync unzip wget xz-utils zip
+
+      - name: Compute image cache identity
+        id: identity
+        run: echo "digest=$(support/gamejay-dependency-id.sh image)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore source downloads
+        id: restore-image-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-image-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-image-dl-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Restore compiler cache
+        id: restore-image-ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-image-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
+          restore-keys: |
+            gamejay-image-ccache-${{ env.BUILDROOT_VERSION }}-
+
+      - name: Download Buildroot
+        run: |
+          wget -q "https://buildroot.org/downloads/buildroot-${BUILDROOT_VERSION}.tar.xz"
+          tar -xf "buildroot-${BUILDROOT_VERSION}.tar.xz"
+
+      - name: Configure Buildroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          buildroot="$GITHUB_WORKSPACE/buildroot-${BUILDROOT_VERSION}"
+          output="$GITHUB_WORKSPACE/output"
+          make -C "$buildroot" \
+            O="$output" \
+            BR2_EXTERNAL="$GITHUB_WORKSPACE" \
+            BR2_DL_DIR="$GITHUB_WORKSPACE/.br-dl" \
+            BR2_CCACHE_DIR="$GITHUB_WORKSPACE/.br-ccache" \
+            gamejay_x86_64_defconfig
+
+      - name: Download pinned base, kernel, and cores
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_TAG: ${{ needs.base.outputs.tag }}
+          KERNEL_TAG: ${{ needs.kernel.outputs.tag }}
+          CORES_TAG: ${{ needs.cores.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p \
+            .prebuilt/base .prebuilt/base-download \
+            .prebuilt/kernel .prebuilt/cores output/images
+
+          gh release download "$BASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern gamejay-base.tar.xz --pattern SHA256SUMS \
+            --dir .prebuilt/base-download
+          (
+            cd .prebuilt/base-download
+            sha256sum -c SHA256SUMS
+            tar -xf gamejay-base.tar.xz -C ../base
+          )
+
+          gh release download "$KERNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern bzImage --pattern SHA256SUMS \
+            --dir .prebuilt/kernel
+          (
+            cd .prebuilt/kernel
+            sha256sum -c SHA256SUMS
+          )
+          cp .prebuilt/kernel/bzImage output/images/bzImage
+
+          gh release download "$CORES_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern gamejay-cores.tar.xz --pattern SHA256SUMS \
+            --dir .prebuilt/cores-download
+          (
+            cd .prebuilt/cores-download
+            sha256sum -c SHA256SUMS
+            tar -xf gamejay-cores.tar.xz
+          )
+          cp .prebuilt/cores-download/cores/*_libretro.so .prebuilt/cores/
+
+      - name: Build GameJay OS
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C "$GITHUB_WORKSPACE/buildroot-${BUILDROOT_VERSION}" \
+            O="$GITHUB_WORKSPACE/output" \
+            BR2_EXTERNAL="$GITHUB_WORKSPACE" \
+            BR2_DL_DIR="$GITHUB_WORKSPACE/.br-dl" \
+            BR2_CCACHE_DIR="$GITHUB_WORKSPACE/.br-ccache" \
+            -j"$(nproc)"
+
+      - name: Verify image contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x output/target/usr/bin/gamejay-menu
+          test -x output/target/usr/bin/retroarch
+          test -s output/target/boot/bzImage
+          grep -q 'tty1::respawn:/usr/bin/gamejay-start' output/target/etc/inittab
+          for core in \
+            snes9x2010_libretro.so fceumm_libretro.so picodrive_libretro.so \
+            mame2003_plus_libretro.so pcsx_rearmed_libretro.so
+          do
+            test -s "output/target/usr/lib/libretro/$core"
+          done
+          test -s output/images/gamejay.img
+          test -s output/images/gamejay-bios.img
+          grep -q 'GameJay OS' output/images/efi-part/EFI/BOOT/grub.cfg
+
+      - name: Package corresponding application source
+        shell: bash
+        run: |
+          set -euo pipefail
+          retroarch_source="$(find output/build -maxdepth 1 \
+            -type d -name 'retroarch-*' -print -quit)"
+          test -n "$retroarch_source"
+          mkdir -p release-application-source/packages
+          cp -a "$retroarch_source" release-application-source/
+          cp -a package/retroarch package/gamejay-menu \
+            release-application-source/packages/
+          tar -C release-application-source -I 'xz -T0 -1' \
+            -cf output/images/gamejay-application-sources.tar.xz .
+          (
+            cd output/images
+            sha256sum gamejay-application-sources.tar.xz \
+              > SOURCES_SHA256SUMS
+          )
+
+      - name: Compress and checksum images
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd output/images
+          xz -T0 -1 --keep gamejay.img
+          xz -T0 -1 --keep gamejay-bios.img
+          sha256sum gamejay.img.xz gamejay-bios.img.xz > SHA256SUMS
+          zip -0 gamejay-images.zip \
+            gamejay.img.xz gamejay-bios.img.xz SHA256SUMS
+
+      - name: Upload image artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gamejay-images-${{ github.sha }}
+          name: gamejay-images
           path: |
             output/images/gamejay-images.zip
             output/images/gamejay.img.xz
             output/images/gamejay-bios.img.xz
             output/images/SHA256SUMS
-          if-no-files-found: error
+            output/images/gamejay-application-sources.tar.xz
+            output/images/SOURCES_SHA256SUMS
           compression-level: 0
-          retention-days: 14
+          if-no-files-found: error
 
-      - name: Define release
-        id: release
-        shell: bash
-        run: |
-          short_sha="${GITHUB_SHA::7}"
-          release_tag="gamejay-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${short_sha}"
-          echo "tag=${release_tag}" >> "${GITHUB_OUTPUT}"
-          echo "url=https://github.com/${GITHUB_REPOSITORY}/releases/tag/${release_tag}" >> "${GITHUB_OUTPUT}"
-
-      - name: Create GitHub release
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          BASE_TAG: ${{ needs.base.outputs.tag }}
+          KERNEL_TAG: ${{ needs.kernel.outputs.tag }}
+          CORES_TAG: ${{ needs.cores.outputs.tag }}
+        shell: bash
         run: |
-          asset_base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
-          cat > "${RUNNER_TEMP}/release-notes.md" <<EOF
-          Bootable GameJay OS images built from commit \`${GITHUB_SHA}\`.
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          tag="gamejay-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}-${short_sha}"
+          repo_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          asset_url="${repo_url}/releases/download/${tag}"
+          cat > release-notes.md <<EOF
+          Bootable GameJay images built from commit \`${GITHUB_SHA}\`.
 
-          ## Downloads
-
-          - [GameJay image bundle (ZIP)](${asset_base}/gamejay-images.zip) - both images and checksums
-          - [64-bit UEFI image](${asset_base}/gamejay.img.xz) - preferred for modern PCs
-          - [Legacy BIOS image](${asset_base}/gamejay-bios.img.xz) - for older PCs
-          - [SHA-256 checksums](${asset_base}/SHA256SUMS)
-
-          Decompress the appropriate \`.xz\` image before writing it with \`dd\`,
-          RawWrite, Rufus in DD mode, balenaEtcher, or WSL. Writing an image
-          erases the destination device.
+          - [Complete ZIP bundle](${asset_url}/gamejay-images.zip)
+          - [UEFI/GPT image](${asset_url}/gamejay.img.xz)
+          - [Legacy BIOS/MBR image](${asset_url}/gamejay-bios.img.xz)
+          - [SHA-256 checksums](${asset_url}/SHA256SUMS)
+          - [RetroArch and GameJay application source](${asset_url}/gamejay-application-sources.tar.xz)
+          - [Application source checksum](${asset_url}/SOURCES_SHA256SUMS)
+          - [Pinned ABI-matched base](${repo_url}/releases/tag/${BASE_TAG})
+          - [Pinned kernel dependency](${repo_url}/releases/tag/${KERNEL_TAG})
+          - [Pinned emulator-core dependency and source revisions](${repo_url}/releases/tag/${CORES_TAG})
           EOF
+          gh release create "$tag" \
+            output/images/gamejay-images.zip \
+            output/images/gamejay.img.xz \
+            output/images/gamejay-bios.img.xz \
+            output/images/SHA256SUMS \
+            output/images/gamejay-application-sources.tar.xz \
+            output/images/SOURCES_SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GameJay ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}" \
+            --notes-file release-notes.md
 
-          gh release create "${RELEASE_TAG}" \
-            --target "${GITHUB_SHA}" \
-            --title "GameJay OS ${RELEASE_TAG}" \
-            --notes-file "${RUNNER_TEMP}/release-notes.md" \
-            "${OUTPUT_DIR}/images/gamejay-images.zip#GameJay image bundle" \
-            "${OUTPUT_DIR}/images/gamejay.img.xz#64-bit UEFI image" \
-            "${OUTPUT_DIR}/images/gamejay-bios.img.xz#Legacy BIOS image" \
-            "${OUTPUT_DIR}/images/SHA256SUMS#SHA-256 checksums"
+      - name: Save source downloads
+        if: success() && steps.restore-image-downloads.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-dl
+          key: gamejay-image-dl-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}
 
-      - name: Publish release link
-        run: |
-          echo "## GameJay release" >> "${GITHUB_STEP_SUMMARY}"
-          echo "[Download GameJay images](${{ steps.release.outputs.url }})" \
-            >> "${GITHUB_STEP_SUMMARY}"
+      - name: Save compiler cache
+        if: always() && steps.restore-image-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.br-ccache
+          key: gamejay-image-ccache-${{ env.BUILDROOT_VERSION }}-${{ steps.identity.outputs.digest }}

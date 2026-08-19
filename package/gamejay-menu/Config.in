@@ -1,6 +1,5 @@
 config BR2_PACKAGE_GAMEJAY_MENU
 	bool "gamejay-menu"
-	depends on BR2_PACKAGE_SDL2
-	depends on BR2_PACKAGE_SDL2_TTF
+	depends on BR2_PACKAGE_GAMEJAY_PREBUILT_BASE
 	help
 	  Controller-first SDL2 launcher for GameJay OS.

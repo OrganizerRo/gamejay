@@ -1,3 +1,6 @@
 /.buildroot/
+/.br-ccache/
+/.br-dl/
+/.prebuilt/
 /output/
 /*.tar.xz

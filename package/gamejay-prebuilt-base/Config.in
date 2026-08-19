@@ -1,0 +1,5 @@
+config BR2_PACKAGE_GAMEJAY_PREBUILT_BASE
+	bool "GameJay prebuilt ABI-matched base"
+	help
+	  Install the checksum-verified target, staging, and bootloader
+	  bundle prepared by the Build GameJay images workflow.

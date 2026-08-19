@@ -1,0 +1,296 @@
+# GameJay build optimizations
+
+This document records the build-time improvements used by
+`.github/workflows/Build-gamejay-img.yml`, why each was selected, and how to
+recreate the implementation.
+
+## Goals
+
+- Keep the final OS reproducible and bootable on generic x86-64 hardware.
+- Avoid rebuilding stable dependencies on every image build.
+- Preserve source revisions, checksums, and license information.
+- Reuse completed work after a late workflow failure.
+- Reduce image generation, compression, upload, and download time.
+
+The workflow deliberately does not use mutable Libretro nightly archives,
+generic desktop RetroArch binaries, partial Buildroot output directories, or
+fabricated Buildroot stamp files.
+
+## Architecture
+
+The workflow has four jobs:
+
+1. `base` builds the ABI-matched target and staging sysroot only when its
+   content identity has changed. It contains firmware, Mesa, SDL2, GRUB, and
+   the stable rootfs libraries.
+2. `kernel` builds Linux only when its content identity has changed and
+   publishes `bzImage` as a checksum-protected prerelease.
+3. `cores` builds the five pinned Libretro cores only when their recipes or
+   configuration have changed and publishes them with source and license
+   metadata.
+4. `image` downloads those verified dependencies, builds the remaining
+   userspace, assembles the UEFI and BIOS images, and publishes the release.
+
+The base, kernel, and core jobs run in parallel. On a warm build they only
+calculate an identity and confirm that the corresponding prerelease exists.
+Workflow runs are serialized across refs because content-addressed tags are
+shared; this prevents two runs from racing to publish the same dependency.
+
+## 1. Use a pinned external toolchain
+
+The original Buildroot configuration compiled GCC, binutils, glibc, and Linux
+headers on every clean runner. The image and dependency configurations now use
+Buildroot's verified Bootlin integration:
+
+```text
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_BOOTLIN=y
+BR2_TOOLCHAIN_EXTERNAL_BOOTLIN_X86_64_GLIBC_STABLE=y
+```
+
+Buildroot 2025.02.10 resolves this to Bootlin's stable 2024.05-1 x86-64 glibc
+toolchain. It provides GCC 13.3, glibc 2.39, binutils 2.41, C++, NPTL, and the
+MMX/SSE/SSE2 baseline required by generic x86-64 GameJay systems.
+
+To reproduce this optimization:
+
+1. Replace the internal `BR2_TOOLCHAIN_BUILDROOT_*`, GCC, and custom userspace
+   header selections with the three symbols above.
+2. Keep `BR2_TOOLCHAIN_BUILDROOT_CXX=y` where packages require C++.
+3. Remove internal-toolchain-only header settings. The 6.12 kernel can run
+   userspace built against the toolchain's older compatible UAPI headers.
+4. Run each defconfig and inspect the generated `.config` to ensure the Bootlin
+   stable symbol remains selected.
+
+This removes the largest unnecessary clean-build compilation step. The
+tradeoff is dependence on Bootlin's pinned toolchain archive rather than a
+locally compiled toolchain.
+
+## 2. Split the build into immutable dependency releases
+
+The main configuration no longer selects the Linux kernel or source core
+packages. Separate configurations define those dependency builds:
+
+- `configs/gamejay_base_x86_64_defconfig`
+- `configs/gamejay_kernel_x86_64_defconfig`
+- `configs/gamejay_cores_x86_64_defconfig`
+
+`support/gamejay-dependency-id.sh` hashes the Buildroot version and every
+relevant configuration or recipe. It produces tags such as:
+
+```text
+gamejay-kernel-2025.02.10-<16-character-digest>
+gamejay-cores-2025.02.10-<16-character-digest>
+```
+
+If a tag exists, its binary is reused. If it does not exist, the workflow
+builds from pinned source and creates a prerelease targeted at the exact commit.
+Changing a kernel fragment, core source revision, recipe, configuration, or the
+identity script creates a new tag instead of overwriting an old binary.
+
+### ABI-matched base
+
+The base is built through an ordinary Buildroot output tree and contains:
+
+- the target runtime tree, including firmware, Mesa, SDL2, ALSA, udev,
+  util-linux, exFAT tools, fonts, and their transitive libraries;
+- the staging sysroot, including headers, libraries, and pkg-config metadata
+  needed to compile GameJay-specific applications;
+- BIOS and UEFI GRUB images;
+- Buildroot's legal manifest and license files; and
+- the exact defconfig and toolchain identity.
+
+The runtime archive and corresponding-source archive are separate release
+assets. Normal image jobs download only the runtime archive and checksum.
+`gamejay-prebuilt-base` installs the target fragment into `TARGET_DIR`, the
+development fragment into `STAGING_DIR`, and bootloader files into
+`BINARIES_DIR`. This is a normal Buildroot package flow: it does not restore a
+partial output directory or create package stamp files.
+
+RetroArch and the menu depend on this package plus `host-pkgconf`. Their
+configure and compile steps therefore use the ABI-matched headers and libraries
+without rebuilding Mesa or SDL2. GRUB is generated by the base build using the
+tracked module configuration and reused as an image input.
+
+### Kernel
+
+The kernel job builds the normal Buildroot `linux` target and publishes:
+
+- `bzImage`
+- `SHA256SUMS`
+
+The kernel fragment disables loadable modules so the reusable `bzImage`
+contains all selected drivers and does not require a matching module tree.
+This avoids unsafe restoration of `output/build/linux-*` or manual creation of
+Buildroot `.stamp_*` files.
+
+### Emulator cores
+
+The core job builds:
+
+- Snes9x 2010
+- FCEUmm
+- PicoDrive
+- MAME 2003-Plus
+- PCSX-ReARMed
+
+The recipes pass the cross compiler tools explicitly but do not pass
+Buildroot's complete `TARGET_CONFIGURE_OPTS` on the GNU Make command line.
+Several upstream core makefiles append required include paths, defines, and
+libraries to `CFLAGS`; command-line `CFLAGS` prevents GNU Make from applying
+those additions. The safe pattern is:
+
+```make
+$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) \
+	CC="$(TARGET_CC)" CXX="$(TARGET_CXX)" AR="$(TARGET_AR)" \
+	LD="$(TARGET_CC)" RANLIB="$(TARGET_RANLIB)" \
+	STRIP="$(TARGET_STRIP)" platform=unix
+```
+
+`LD` intentionally points to the compiler driver because these projects pass
+driver options such as `-Wl,...` during linking.
+
+The published runtime core archive contains the five shared libraries, source
+revision metadata, and discovered license files. A separate source archive
+contains the exact extracted source trees and GameJay recipes needed to satisfy
+binary redistribution obligations. The main image downloads only the runtime
+archive and installs it through the local `gamejay-prebuilt-cores` package.
+Mutable upstream nightlies are not used because their contents can change
+without a new URL or checksum.
+
+Kernel prereleases similarly publish the exact patched Linux source tree,
+resolved configuration inputs, and a separate source checksum. Final image
+releases publish the exact RetroArch source tree plus the GameJay RetroArch and
+menu recipes. Runtime consumers use explicit release download patterns, so
+these source archives satisfy redistribution obligations without being fetched
+by normal image builds.
+
+## 3. Keep separate persistent caches
+
+All jobs use two independent directories:
+
+```text
+.br-dl       Buildroot source archives and Git checkouts
+.br-ccache   content-addressed compiler objects
+```
+
+Passing them explicitly avoids Buildroot's default ccache directory being
+mistaken for a download directory:
+
+```sh
+make -C "$buildroot" \
+  BR2_DL_DIR="$GITHUB_WORKSPACE/.br-dl" \
+  BR2_CCACHE_DIR="$GITHUB_WORKSPACE/.br-ccache" ...
+```
+
+Each cache key contains its job role, Buildroot version, and dependency
+identity. A prefix restore key allows reuse after a related input changes.
+
+Download caches are saved only after a successful job so a partial or corrupt
+download is not persisted. Ccache is saved with `always()` because completed
+content-addressed objects remain useful after an unrelated compile failure.
+Save steps skip exact cache hits because GitHub cache entries are immutable.
+
+This also makes the large `linux-firmware` download reusable without
+maintaining a custom firmware fork. Buildroot still installs only the selected
+AMDGPU and Radeon directories.
+
+## 4. Continue source-building GameJay-specific userspace
+
+RetroArch and the GameJay menu remain source builds against the ABI-matched
+base. Generic RetroArch distributions commonly depend on X11, Qt, Vulkan,
+desktop audio stacks, or shared-library versions absent from this appliance.
+Mesa, SDL2, firmware, GRUB, and stable rootfs libraries come from the GameJay
+base built from the same Buildroot and toolchain configuration.
+
+The external toolchain and ccache accelerate the two remaining source packages
+without changing their target ABI or feature selection.
+
+## 5. Reduce image and packaging work
+
+The initial `ROMDATA` exFAT partition is 256 MiB instead of 2 GiB. The final
+partition remains last in both disk layouts, so users can expand it to fill an
+SD card or USB drive after flashing. This reduces raw image assembly,
+compression, upload, and download work at the cost of less initial ROM space.
+
+Release images use fast multithreaded xz compression:
+
+```sh
+xz -T0 -1 --keep gamejay.img
+xz -T0 -1 --keep gamejay-bios.img
+```
+
+The outer ZIP uses store mode because recompressing `.xz` data wastes CPU for
+negligible size reduction:
+
+```sh
+zip -0 gamejay-images.zip \
+  gamejay.img.xz gamejay-bios.img.xz SHA256SUMS
+```
+
+`actions/upload-artifact` also uses `compression-level: 0`.
+
+## 6. Verify before publishing
+
+The image job verifies that the output contains:
+
+- the GameJay SDL launcher;
+- the custom RetroArch frontend;
+- the pinned kernel;
+- all five emulator cores;
+- the BusyBox `inittab` launcher entry;
+- non-empty UEFI/GPT and BIOS/MBR raw images; and
+- the GRUB GameJay menu configuration.
+
+Downloaded base, kernel, and core assets are checked with `sha256sum -c` before
+they enter the image. The final compressed images receive their own
+`SHA256SUMS`, and release notes link to dependency releases for provenance.
+
+## Local implementation
+
+Install the documented Buildroot host prerequisites, then run:
+
+```sh
+wget https://buildroot.org/downloads/buildroot-2025.02.10.tar.xz
+tar -xf buildroot-2025.02.10.tar.xz
+
+make -C buildroot-2025.02.10 O="$PWD/output" \
+  BR2_EXTERNAL="$PWD" \
+  BR2_DL_DIR="$PWD/.br-dl" \
+  BR2_CCACHE_DIR="$PWD/.br-ccache" \
+  gamejay_x86_64_defconfig
+
+support/prepare-prebuilt.sh "$PWD/output"
+
+make -C buildroot-2025.02.10 O="$PWD/output" \
+  BR2_EXTERNAL="$PWD" \
+  BR2_DL_DIR="$PWD/.br-dl" \
+  BR2_CCACHE_DIR="$PWD/.br-ccache" \
+  -j"$(nproc)"
+```
+
+`support/prepare-prebuilt.sh` derives the same dependency identities as CI,
+clears obsolete local extraction directories, downloads the matching GameJay
+releases, verifies their checksums, places the kernel in `output/images`, and
+prepares the local base and core package sources.
+
+To rebuild a dependency rather than consume a release, configure its dedicated
+defconfig in a separate output directory and build `linux` or the five
+`libretro-*` package targets. Publish the resulting files under the exact tag
+reported by `support/gamejay-dependency-id.sh`.
+
+## Maintenance checklist
+
+When changing the build:
+
+1. Add base configuration inputs to the `base` identity list.
+2. Add new kernel inputs to the `kernel` identity list.
+3. Keep core recipes under `package/libretro-*`; they are included
+   automatically in the `cores` identity.
+4. Add a new core package to the core defconfig, workflow build target list,
+   archive list, and image verification list.
+5. Update the expected core name in the menu and runtime configuration.
+6. Bump the Buildroot version both in the workflow and identity script.
+7. Never replace an existing content-addressed dependency release. Change an
+   input so a new identity and tag are generated.
+8. Run workflow linting and all four Buildroot defconfigs before publishing.
