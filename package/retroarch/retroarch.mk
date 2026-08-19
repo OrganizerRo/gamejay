@@ -8,7 +8,7 @@ RETROARCH_VERSION = 250919d9c4851e7389d45952fd7f08d60efc0b3d
 RETROARCH_SITE = $(call github,libretro,RetroArch,$(RETROARCH_VERSION))
 RETROARCH_LICENSE = GPL-3.0
 RETROARCH_LICENSE_FILES = COPYING
-RETROARCH_DEPENDENCIES = alsa-lib libdrm libevdev mesa3d sdl2 udev
+RETROARCH_DEPENDENCIES = gamejay-prebuilt-base host-pkgconf
 
 define RETROARCH_CONFIGURE_CMDS
 	(cd $(@D) && \

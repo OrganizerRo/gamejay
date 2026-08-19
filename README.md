@@ -12,16 +12,16 @@ the first console, and restarts it if it exits.
 
 ## Included systems
 
-| System | Libretro core | ROM directory |
-|---|---|---|
-| Super Nintendo | Snes9x 2010 | `snes` |
-| Nintendo Entertainment System | FCEUmm | `nes` |
-| Sega Genesis, Mega Drive, and 32X | PicoDrive | `genesis` |
-| Arcade | MAME 2003-Plus | `arcade` |
-| PlayStation | PCSX-ReARMed | `ps1` |
+| System                            | Libretro core  | ROM directory |
+| --------------------------------- | -------------- | ------------- |
+| Super Nintendo                    | Snes9x 2010    | `snes`        |
+| Nintendo Entertainment System     | FCEUmm         | `nes`         |
+| Sega Genesis, Mega Drive, and 32X | PicoDrive      | `genesis`     |
+| Arcade                            | MAME 2003-Plus | `arcade`      |
+| PlayStation                       | PCSX-ReARMed   | `ps1`         |
 
-All components are compiled into the image. ROMs and proprietary BIOS files
-are not included.
+All runtime components are included in the image. ROMs and proprietary BIOS
+files are not included.
 
 ## Architecture
 
@@ -54,16 +54,20 @@ faster, smaller, and avoids two applications competing for DRM ownership.
 
 ## Repository layout
 
-| Path | Purpose |
-|---|---|
-| `.github/workflows/Build-gamejay-img.yml` | Reproducible GitHub image build |
-| `configs/gamejay_x86_64_defconfig` | Complete Buildroot configuration |
-| `board/gamejay/` | Kernel fragment, GRUB config, and image generation |
-| `package/gamejay-menu/` | SDL2 launcher source and Buildroot package |
-| `package/retroarch/` | Pinned RetroArch frontend package |
-| `package/libretro-*/` | Pinned emulator core packages |
-| `rootfs-overlay/` | Init, mount, launcher, and RetroArch runtime files |
-| `Config.in`, `external.mk`, `external.desc` | Buildroot external-tree entry points |
+| Path                                                   | Purpose                                            |
+| ------------------------------------------------------ | -------------------------------------------------- |
+| `.github/workflows/Build-gamejay-img.yml`              | Reproducible GitHub image build                    |
+| `BUILD_OPTIMIZATIONS.md`                               | Technical build acceleration guide                 |
+| `configs/gamejay_x86_64_defconfig`                     | Complete Buildroot configuration                   |
+| `configs/gamejay_{base,kernel,cores}_x86_64_defconfig` | Reusable dependency builds                         |
+| `board/gamejay/`                                       | Kernel fragment, GRUB config, and image generation |
+| `package/gamejay-menu/`                                | SDL2 launcher source and Buildroot package         |
+| `package/retroarch/`                                   | Pinned RetroArch frontend package                  |
+| `package/libretro-*/`                                  | Pinned emulator core packages                      |
+| `package/gamejay-prebuilt-{base,cores}/`               | Verified dependency-bundle installers              |
+| `rootfs-overlay/`                                      | Init, mount, launcher, and RetroArch runtime files |
+| `support/`                                             | Dependency identity and local download helpers     |
+| `Config.in`, `external.mk`, `external.desc`            | Buildroot external-tree entry points               |
 
 Buildroot itself is downloaded at build time and is not vendored.
 
@@ -71,16 +75,22 @@ Buildroot itself is downloaded at build time and is not vendored.
 
 1. Push the repository to GitHub.
 2. Open **Actions**.
-3. Select **Build-gamejay-img**.
+3. Select **Build GameJay images**.
 4. Select **Run workflow**.
 5. Open the release linked in the workflow summary and download the combined
-   ZIP or an individual image. The run also retains
-   `gamejay-images-<commit>` as a GitHub Actions artifact for 14 days.
+   ZIP or an individual image. The run also retains `gamejay-images` as a
+   GitHub Actions artifact.
 
-The workflow is also triggered by relevant changes pushed to `master`. It pins
-Buildroot `2025.02.10`, caches source downloads, compiles the kernel, GameJay
-menu, RetroArch, and all cores, creates both disk layouts, verifies the output,
-and creates a GitHub Release containing:
+The workflow is also triggered by changes pushed to `master`. It pins
+Buildroot `2025.02.10` and Bootlin's stable 2024.05-1 x86-64 glibc toolchain.
+Four jobs prepare a content-addressed ABI-matched userspace base, Linux kernel,
+five-core bundle, and final OS image. The three dependency jobs run in parallel
+and compile only when their pinned source or configuration changes. Unchanged
+image builds download checksum-verified binaries from GameJay prereleases.
+
+The image job adds the GameJay menu and RetroArch to the verified target and
+staging base, creates both disk layouts, verifies the output, and creates a
+GitHub Release containing:
 
 - `gamejay-images.zip` - both compressed images and their checksums.
 - `gamejay.img.xz` - GPT image for 64-bit UEFI systems.
@@ -90,6 +100,33 @@ and creates a GitHub Release containing:
 The release page links to every individual file as well as the combined ZIP.
 Release tags use `gamejay-<workflow-run>.<attempt>-<short-commit>`, so reruns
 never overwrite an earlier build.
+
+### Build acceleration and reproducibility
+
+| Component                                    | Strategy                                   | Reason                                                                                                      |
+| -------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| GCC, glibc, binutils                         | Pinned Bootlin external toolchain          | Avoids roughly half an hour of toolchain compilation while retaining checksum verification                  |
+| Linux kernel                                 | GameJay-built content-addressed prerelease | Avoids rebuilding an unchanged kernel without unsafe Buildroot stamp injection                              |
+| Mesa, SDL2, GRUB, firmware, rootfs libraries | ABI-matched target/staging base prerelease | Avoids rebuilding the stable system base while preserving headers and pkg-config metadata                   |
+| Libretro cores                               | GameJay-built content-addressed prerelease | Avoids repeated compilation and mutable upstream nightlies; corresponding source and licenses are published |
+| RetroArch and menu                           | Build from pinned source against the base  | Preserves GameJay-specific KMS features while avoiding the expensive dependency rebuild                     |
+
+Downloads and compiler objects use separate `.br-dl` and `.br-ccache` caches.
+Both are saved even when a late step fails, so validated downloads and completed
+compiler objects survive failed workflows. Cache identities include Buildroot
+and the relevant package and configuration inputs.
+
+The first build for a new dependency identity compiles and publishes the base,
+kernel, and cores. Later builds reuse those immutable releases. Runtime assets
+are separate from corresponding-source archives, so normal image builds do not
+download source bundles. This is safer than caching partial Buildroot output
+trees or consuming mutable nightly binaries.
+
+Release compression uses multithreaded `xz -1`, and the outer ZIP stores the
+already-compressed files instead of recompressing them. The initial `ROMDATA`
+partition is 256 MiB rather than 2 GiB, which reduces image assembly, upload,
+and download time while still leaving writable space for testing. The tradeoff
+is that users should expand the final partition before adding a large library.
 
 **UEFI** is preferred for modern hardware and uses GPT. **Legacy BIOS** is
 provided for older PCs and uses MBR. Separate images keep each boot path
@@ -116,8 +153,14 @@ wget https://buildroot.org/downloads/buildroot-2025.02.10.tar.xz
 tar -xf buildroot-2025.02.10.tar.xz
 make -C buildroot-2025.02.10 O="$PWD/output" \
   BR2_EXTERNAL="$PWD" gamejay_x86_64_defconfig
+support/prepare-prebuilt.sh "$PWD/output"
 make -C buildroot-2025.02.10 O="$PWD/output" -j"$(nproc)"
 ```
+
+The helper downloads the checksum-verified base, kernel, and core releases
+matching the tracked configuration. Reusing the same `output` directory
+preserves Buildroot's incremental state. For persistent cross-output caching,
+also pass `BR2_DL_DIR` and `BR2_CCACHE_DIR` as shown in the workflow.
 
 The completed raw images are:
 
@@ -194,7 +237,7 @@ ROMDATA/
 Place each game in the matching system directory. PlayStation BIOS files belong
 in `bios`. Save files and states persist in `saves` and `states`.
 
-The generated image reserves 768 MiB for the OS and 2 GiB for `ROMDATA`.
+The generated image reserves 768 MiB for the OS and 256 MiB for `ROMDATA`.
 After writing to a larger card or drive, use Disk Management, GParted, or
 another partition editor to grow the final `ROMDATA` partition into the
 remaining unallocated space.
@@ -203,12 +246,12 @@ Only use ROMs and BIOS files that you are legally permitted to use.
 
 ## Controls
 
-| Context | Keyboard | Controller |
-|---|---|---|
-| Move selection | Arrow keys | D-pad |
-| Select | Enter or Space | A |
-| Back | Escape | B |
-| Exit a game | - | Select + Start |
+| Context        | Keyboard       | Controller     |
+| -------------- | -------------- | -------------- |
+| Move selection | Arrow keys     | D-pad          |
+| Select         | Enter or Space | A              |
+| Back           | Escape         | B              |
+| Exit a game    | -              | Select + Start |
 
 The image includes the PlayStation-style dual-stick mapping requested in the
 design. RetroArch's udev auto-detection handles other standard USB gamepads.
@@ -277,12 +320,14 @@ processors or 32-bit UEFI firmware.
 ## Customization
 
 - Add or remove systems in `package/gamejay-menu/src/gamejay-menu.c`.
-- Add a corresponding Buildroot core package under `package/`.
+- Add a corresponding Buildroot core package under `package/`, update
+  `configs/gamejay_cores_x86_64_defconfig`, and add its output to the core job.
 - Change kernel hardware support in `board/gamejay/linux-fragment.config`.
 - Tune RetroArch in `rootfs-overlay/etc/retroarch.cfg`.
 - Change image partition sizes in `configs/gamejay_x86_64_defconfig` and
   `board/gamejay/post-image.sh`.
 - Change boot arguments in `board/gamejay/grub.cfg`.
 
-All source revisions are pinned in their package `.mk` files so workflow builds
-remain repeatable.
+All source revisions are pinned in their package `.mk` files. Dependency tags
+derive from those recipes and configurations, so relevant changes create new
+immutable bundles rather than replacing old binaries.
