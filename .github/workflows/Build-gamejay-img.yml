@@ -3,7 +3,7 @@ name: Build-gamejay-img
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - ".github/workflows/Build-gamejay-img.yml"
       - "board/**"

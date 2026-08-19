@@ -77,7 +77,7 @@ Buildroot itself is downloaded at build time and is not vendored.
    ZIP or an individual image. The run also retains
    `gamejay-images-<commit>` as a GitHub Actions artifact for 14 days.
 
-The workflow is also triggered by relevant changes pushed to `main`. It pins
+The workflow is also triggered by relevant changes pushed to `master`. It pins
 Buildroot `2025.02.10`, caches source downloads, compiles the kernel, GameJay
 menu, RetroArch, and all cores, creates both disk layouts, verifies the output,
 and creates a GitHub Release containing:
