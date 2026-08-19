@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gamejay <gamejay@example.com>
+Date: Wed, 19 Aug 2026 10:00:00 +0000
+Subject: [PATCH] Define FCEU_VERSION_NUMERIC in state.c
+
+The constant FCEU_VERSION_NUMERIC is referenced in state.c but was never
+defined in the codebase. Based on the comment in state.c it was bumped
+to 9900 together with the FlipByteOrder fix in this commit.
+---
+ src/state.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/state.c b/src/state.c
+index 1111111..2222222 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -53,6 +53,7 @@ int SFEXINDEX;
+ /* Convenience aliases for the SFORMAT 's' field bit layout. The
+  * encoding is documented in state.h. */
+ #define RLSB         FCEUSTATE_RLSB
++#define FCEU_VERSION_NUMERIC 9900
+ #define STRIDE_MASK  FCEUSTATE_STRIDE_MASK
+ #define STRIDE_SHIFT FCEUSTATE_STRIDE_SHIFT
+ #define SIZE_MASK    FCEUSTATE_SIZE_MASK
