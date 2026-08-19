@@ -150,6 +150,12 @@ $(TARGET_MAKE_ENV) $(MAKE) -C $(@D) \
 `LD` intentionally points to the compiler driver because these projects pass
 driver options such as `-Wl,...` during linking.
 
+Snes9x 2010 also receives `LTO=`. Its upstream Unix build enables link-time
+optimization by default, but the pinned external toolchain produced a non-PIC
+LTO relocation while linking the shared core despite compiling every object
+with `-fPIC`. Disabling LTO makes the reusable plugin link deterministic and
+reduces its build time.
+
 The published runtime core archive contains the five shared libraries, source
 revision metadata, and discovered license files. A separate source archive
 contains the exact extracted source trees and GameJay recipes needed to satisfy
