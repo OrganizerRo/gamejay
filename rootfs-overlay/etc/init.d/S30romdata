@@ -1,0 +1,33 @@
+#!/bin/sh
+
+case "$1" in
+	start)
+		mkdir -p /mnt/roms
+		device="$(blkid -L ROMDATA 2>/dev/null || true)"
+		if [ -z "$device" ]; then
+			for candidate in /dev/sd[a-z][0-9] /dev/mmcblk[0-9]p[0-9] /dev/nvme[0-9]n[0-9]p[0-9]; do
+				[ -b "$candidate" ] || continue
+				if [ "$(blkid -s LABEL -o value "$candidate" 2>/dev/null)" = "ROMDATA" ]; then
+					device="$candidate"
+					break
+				fi
+			done
+		fi
+
+		if [ -n "$device" ] && mount -t exfat -o rw,umask=000 "$device" /mnt/roms; then
+			for directory in snes nes genesis arcade ps1 bios saves states config; do
+				mkdir -p "/mnt/roms/$directory"
+			done
+			echo "GameJay: mounted ROMDATA from $device"
+		else
+			mount -t tmpfs -o mode=0777 tmpfs /mnt/roms
+			for directory in snes nes genesis arcade ps1 bios saves states config; do
+				mkdir -p "/mnt/roms/$directory"
+			done
+			echo "GameJay: ROMDATA not found; using temporary storage"
+		fi
+		;;
+	stop)
+		umount /mnt/roms 2>/dev/null || true
+		;;
+esac

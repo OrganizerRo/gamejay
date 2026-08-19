@@ -1,0 +1,13 @@
+#!/bin/sh
+
+export HOME=/tmp
+export XDG_CONFIG_HOME=/mnt/roms/config
+export SDL_VIDEODRIVER=KMSDRM
+export SDL_AUDIODRIVER=alsa
+
+for ignored in 1 2 3 4 5; do
+	[ -e /dev/dri/card0 ] && break
+	sleep 1
+done
+
+exec /usr/bin/gamejay-menu

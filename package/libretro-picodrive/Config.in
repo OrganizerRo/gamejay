@@ -1,0 +1,4 @@
+config BR2_PACKAGE_LIBRETRO_PICODRIVE
+	bool "picodrive core"
+	help
+	  PicoDrive Sega Genesis, Mega Drive, Sega CD, and 32X core.

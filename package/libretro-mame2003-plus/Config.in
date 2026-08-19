@@ -1,0 +1,4 @@
+config BR2_PACKAGE_LIBRETRO_MAME2003_PLUS
+	bool "mame2003-plus core"
+	help
+	  MAME 2003-Plus arcade libretro core.

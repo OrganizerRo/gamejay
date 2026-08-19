@@ -1,0 +1,4 @@
+config BR2_PACKAGE_LIBRETRO_SNES9X2010
+	bool "snes9x2010 core"
+	help
+	  Performance-focused Super Nintendo libretro core.
